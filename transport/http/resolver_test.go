@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,30 +58,54 @@ func TestParseTarget(t *testing.T) {
 
 type mockRebalancer struct{}
 
-func (m *mockRebalancer) Apply(nodes []selector.Node) {}
+func (m *mockRebalancer) Apply(_ []selector.Node) {}
 
 type mockDiscoveries struct {
 	isSecure bool
+	nextErr  bool
+	stopErr  bool
 }
 
-func (d *mockDiscoveries) GetService(ctx context.Context, serviceName string) ([]*registry.ServiceInstance, error) {
+func (d *mockDiscoveries) GetService(_ context.Context, _ string) ([]*registry.ServiceInstance, error) {
 	return nil, nil
 }
 
+const errServiceName = "needErr"
+
 func (d *mockDiscoveries) Watch(ctx context.Context, serviceName string) (registry.Watcher, error) {
-	return &mockWatch{isSecure: d.isSecure}, nil
+	if serviceName == errServiceName {
+		return nil, errors.New("mock test service name watch err")
+	}
+	return &mockWatch{ctx: ctx, isSecure: d.isSecure, nextErr: d.nextErr, stopErr: d.stopErr}, nil
 }
 
 type mockWatch struct {
+	ctx context.Context
+
 	isSecure bool
 	count    int
+
+	nextErr bool
+	stopErr bool
+
+	lock sync.Mutex
 }
 
 func (m *mockWatch) Next() ([]*registry.ServiceInstance, error) {
-	m.count++
+	select {
+	case <-m.ctx.Done():
+		return nil, m.ctx.Err()
+	default:
+	}
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.nextErr {
+		return nil, errors.New("mock test error")
+	}
 	if m.count == 1 {
 		return nil, errors.New("mock test error")
 	}
+	m.count++
 	instance := &registry.ServiceInstance{
 		ID:        "1",
 		Name:      "kratos",
@@ -95,21 +120,84 @@ func (m *mockWatch) Next() ([]*registry.ServiceInstance, error) {
 }
 
 func (m *mockWatch) Stop() error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.stopErr {
+		return errors.New("mock test error")
+	}
+	// 标记 next 需要报错
+	m.nextErr = true
 	return nil
 }
 
 func TestResolver(t *testing.T) {
-	ta := &Target{
-		Scheme:    "http",
-		Authority: "",
-		Endpoint:  "discovery://helloworld",
+	ta, err := parseTarget("discovery://helloworld", true)
+	if err != nil {
+		t.Errorf("parse err %v", err)
+		return
 	}
-	_, err := newResolver(context.Background(), &mockDiscoveries{true}, ta, &mockRebalancer{}, false, false)
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 异步 无需报错
+	r, err := newResolver(cancelCtx, &mockDiscoveries{true, false, false}, ta, &mockRebalancer{}, false, false, 25)
 	if err != nil {
 		t.Errorf("expect %v, got %v", nil, err)
 	}
-	_, err = newResolver(context.Background(), &mockDiscoveries{false}, ta, &mockRebalancer{}, true, true)
+	if r != nil {
+		_ = r.Close()
+	}
+
+	// 同步 一切正常运行
+	r, err = newResolver(cancelCtx, &mockDiscoveries{false, false, false}, ta, &mockRebalancer{}, true, true, 25)
 	if err != nil {
 		t.Errorf("expect %v, got %v", nil, err)
 	}
+	if r != nil {
+		_ = r.Close()
+	}
+
+	// 同步 但是 next 出错 以及 stop 出错
+	r, err = newResolver(cancelCtx, &mockDiscoveries{false, true, true}, ta, &mockRebalancer{}, true, true, 25)
+	if err == nil {
+		t.Errorf("expect err, got nil")
+	}
+	if r != nil {
+		_ = r.Close()
+	}
+
+	// 同步 service name watch 失败
+	r, err = newResolver(cancelCtx, &mockDiscoveries{false, true, true}, &Target{
+		Scheme:   "discovery",
+		Endpoint: errServiceName,
+	}, &mockRebalancer{}, true, true, 25)
+	if err == nil {
+		t.Errorf("expect err, got nil")
+	}
+	if r != nil {
+		_ = r.Close()
+	}
+
+	cancel()
+
+	// 此处应该打印出来 context.Canceled
+	r, err = newResolver(cancelCtx, &mockDiscoveries{false, false, false}, ta, &mockRebalancer{}, false, false, 25)
+	if err != nil {
+		t.Errorf("expect %v, got %v", nil, err)
+	}
+	if r != nil {
+		_ = r.Close()
+	}
+
+	// 同步 但是服务取消，此时需要报错
+	r, err = newResolver(cancelCtx, &mockDiscoveries{false, false, true}, ta, &mockRebalancer{}, true, true, 25)
+	if err == nil {
+		t.Errorf("expect ctx cancel err, got nil")
+	}
+	if r != nil {
+		_ = r.Close()
+	}
+
+	time.Sleep(100 * time.Millisecond)
 }
